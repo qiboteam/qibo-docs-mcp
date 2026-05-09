@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+
+# MCP index database
+data/*.db
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
