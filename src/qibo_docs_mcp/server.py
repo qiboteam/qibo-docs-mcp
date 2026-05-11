@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -77,7 +78,10 @@ def search_docs(
 
     if not results:
         scope = f" in {library}" if library else ""
-        return f"No results found for '{query}'{scope}. Try broader terms or run `qibo-docs-mcp index` to refresh."
+        return (
+            f"No results found for '{query}'{scope}. "
+            "Try broader terms or run `qibo-docs-mcp index` to refresh."
+        )
 
     lines = [f"## Search results for '{query}'\n"]
     for i, r in enumerate(results, 1):
@@ -112,16 +116,14 @@ def get_page(
 
     markdown = _store.fetch_page(library, path)
     if markdown is None:
-        return {"error": f"Page not found: {library}/{path}. Use list_pages to see available paths."}
+        return {"error": f"Page not found: {library}/{path}. Use list_pages to see available paths."}  # noqa: E501
 
     total = len(markdown)
     chunk = markdown[offset:] if max_length == 0 else markdown[offset: offset + max_length]
     next_offset = offset + len(chunk)
     has_more = next_offset < total
 
-    # Retrieve source URL
-    pages = _store.list_pages(library)
-    source_url = next((p["source_url"] for p in pages if p["path"] == path), "")
+    source_url = _store.fetch_source_url(library, path)
 
     return {
         "content": chunk,
@@ -177,6 +179,12 @@ def libraries_resource() -> str:
 # ---------------------------------------------------------------------------
 
 def run_server(db_path: Path = DEFAULT_DB_PATH, force_reindex: bool = False) -> None:
-    """Sync libraries if needed, then start the MCP stdio server."""
-    _sync_libraries(db_path=db_path, force=force_reindex)
+    """Start the MCP stdio server; sync libraries in a background thread."""
+    sync_thread = threading.Thread(
+        target=_sync_libraries,
+        kwargs={"db_path": db_path, "force": force_reindex},
+        daemon=True,
+        name="qibo-docs-sync",
+    )
+    sync_thread.start()
     mcp.run(transport="stdio")

@@ -61,7 +61,44 @@ CREATE TRIGGER IF NOT EXISTS pages_au AFTER UPDATE ON pages BEGIN
 END;
 """
 
+# ---------------------------------------------------------------------------
+# Persistent connection cache — avoids re-opening + re-running schema checks
+# on every tool call. Invalidated after writes (build_library).
+# ---------------------------------------------------------------------------
 
+_cached_conn: sqlite3.Connection | None = None
+_cached_path: Path | None = None
+
+
+def _get_conn(db_path: Path) -> sqlite3.Connection:
+    """Return a cached SQLite connection, creating it only when needed."""
+    global _cached_conn, _cached_path
+    if _cached_conn is None or _cached_path != db_path:
+        _invalidate_conn()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(_SCHEMA)
+        _cached_conn = conn
+        _cached_path = db_path
+    return _cached_conn
+
+
+def _invalidate_conn() -> None:
+    """Close and discard the cached connection (call after writes)."""
+    global _cached_conn, _cached_path
+    if _cached_conn is not None:
+        try:
+            _cached_conn.close()
+        except Exception:
+            pass
+        _cached_conn = None
+        _cached_path = None
+
+
+# Keep _connect as an alias used by build_library (needs a fresh conn for writes)
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -74,9 +111,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def get_stored_sha(library: str, db_path: Path = DEFAULT_DB_PATH) -> str | None:
     """Return the stored commit SHA for a library, or None if not indexed."""
-    conn = _connect(db_path)
+    conn = _get_conn(db_path)
     row = conn.execute("SELECT commit_sha FROM meta WHERE library = ?", (library,)).fetchone()
-    conn.close()
     return row["commit_sha"] if row else None
 
 
@@ -92,6 +128,7 @@ def build_library(
     db_path: Path = DEFAULT_DB_PATH,
 ) -> None:
     """Replace all indexed pages for a library and store the new commit SHA."""
+    # Use a fresh connection for writes, then invalidate the read cache.
     conn = _connect(db_path)
     with conn:
         # Remove old pages (triggers handle FTS cleanup)
@@ -109,6 +146,7 @@ def build_library(
             (library, commit_sha),
         )
     conn.close()
+    _invalidate_conn()  # force next read to see the new data
 
 
 def search(
@@ -118,7 +156,7 @@ def search(
     db_path: Path = DEFAULT_DB_PATH,
 ) -> list[SearchResult]:
     """BM25-ranked full-text search over all indexed pages."""
-    conn = _connect(db_path)
+    conn = _get_conn(db_path)
 
     if library:
         sql = """
@@ -142,8 +180,6 @@ def search(
             LIMIT ?
         """
         rows = conn.execute(sql, (query, top_k)).fetchall()
-
-    conn.close()
 
     results = []
     for row in rows:
@@ -172,19 +208,27 @@ def search(
 
 def fetch_page(library: str, path: str, db_path: Path = DEFAULT_DB_PATH) -> str | None:
     """Return the full Markdown content of a specific page, or None if not found."""
-    conn = _connect(db_path)
+    conn = _get_conn(db_path)
     row = conn.execute(
         "SELECT markdown FROM pages WHERE library = ? AND path = ?", (library, path)
     ).fetchone()
-    conn.close()
     return row["markdown"] if row else None
+
+
+def fetch_source_url(library: str, path: str, db_path: Path = DEFAULT_DB_PATH) -> str:
+    """Return the rendered source URL for a specific page."""
+    conn = _get_conn(db_path)
+    row = conn.execute(
+        "SELECT source_url FROM pages WHERE library = ? AND path = ?", (library, path)
+    ).fetchone()
+    return row["source_url"] if row else ""
 
 
 def list_pages(
     library: str | None = None, db_path: Path = DEFAULT_DB_PATH
 ) -> list[dict[str, str]]:
     """Return a list of {library, path, title, source_url} for all indexed pages."""
-    conn = _connect(db_path)
+    conn = _get_conn(db_path)
     if library:
         rows = conn.execute(
             "SELECT library, path, title, source_url FROM pages WHERE library = ? ORDER BY path",
@@ -194,5 +238,4 @@ def list_pages(
         rows = conn.execute(
             "SELECT library, path, title, source_url FROM pages ORDER BY library, path"
         ).fetchall()
-    conn.close()
     return [dict(r) for r in rows]

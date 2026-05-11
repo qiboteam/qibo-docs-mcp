@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import html2text
@@ -128,38 +129,45 @@ def _md_to_markdown(md_text: str) -> str:
     return md_text.strip()
 
 
+_FETCH_WORKERS = 10  # max concurrent page downloads
+
+
 def fetch_library_pages(library_name: str, client: httpx.Client) -> list[DocPage]:
     """Fetch all documentation pages for a library and return as DocPage objects."""
     lib = LIBRARY_MAP[library_name]
     rel_paths = _list_doc_files(lib, client)
-    pages: list[DocPage] = []
 
-    for rel_path in rel_paths:
+    def _fetch_one(rel_path: str) -> DocPage | None:
         raw_url = _raw_url(lib, rel_path)
         try:
             resp = client.get(raw_url, headers=_github_headers(), timeout=20)
             resp.raise_for_status()
             content = resp.text
         except httpx.HTTPError:
-            continue
+            return None
 
         if rel_path.endswith(".rst"):
             title = _extract_title_from_rst(content) or rel_path
             markdown = _rst_to_markdown(content)
         else:
-            # .md file — extract first heading as title
             first_line = content.lstrip().splitlines()[0] if content.strip() else ""
             title = first_line.lstrip("#").strip() or rel_path
             markdown = _md_to_markdown(content)
 
-        pages.append(
-            DocPage(
-                library=library_name,
-                path=rel_path,
-                title=title,
-                markdown=markdown,
-                source_url=_source_url(lib, rel_path),
-            )
+        return DocPage(
+            library=library_name,
+            path=rel_path,
+            title=title,
+            markdown=markdown,
+            source_url=_source_url(lib, rel_path),
         )
+
+    with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, p): p for p in rel_paths}
+        pages: list[DocPage] = []
+        for fut in as_completed(futures):
+            page = fut.result()
+            if page is not None:
+                pages.append(page)
 
     return pages
